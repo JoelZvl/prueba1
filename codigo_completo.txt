@@ -1,26 +1,3 @@
-#include <unistd.h>
-#include <sys/select.h>
-#include <time.h>
-
-int kbhit(void)
-{
-    struct timeval tv;
-    fd_set read_fd;
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-    FD_ZERO(&read_fd);
-    FD_SET(0, &read_fd);
-    if (select(1, &read_fd, NULL, NULL, &tv) == -1)
-        return 0;
-
-    if (FD_ISSET(0, &read_fd))
-        return 1;
-
-    return 0;
-}
-
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +44,38 @@ int swap_display_start_frame = 0;          // Frame inicial para mostrar
 int tms_display_start = 0;    // Posición inicial de visualización del TMS
 #define TMS_DISPLAY_ENTRIES 6 // Número de entradas visibles por página
 
+
+
+#define RAM_SIZE_INSTRUCTIONS 256
+#define RAM_FRAME_SIZE_INSTRUCTIONS 16
+#define RAM_FRAMES (RAM_SIZE_INSTRUCTIONS / RAM_FRAME_SIZE_INSTRUCTIONS) // 16 marcos
+#define INSTRUCTION_SIZE_BYTES 32
+
+char RAM[RAM_SIZE_INSTRUCTIONS * INSTRUCTION_SIZE_BYTES]; // Bloque de memoria RAM
+
+typedef struct {
+    int ram_frame;
+    int presence;
+    int swap_frame;
+} TMPEntry;
+
+typedef struct {
+    int pid;          // 0 si está libre
+    int referenced;   // 0 o 1
+} TMMEntry;
+
+TMMEntry TMM[RAM_FRAMES]; // Tabla de Marcos de Memoria (TMM)
+int tmm_clock = 0;         // Índice para algoritmo de reloj
+
+
+
+int tmm_display_start = 0; // Posición inicial de visualización del TMM
+
+int ram_display_start_frame = 0;          // Posición inicial de visualización del RAM
+#define RAM_DISPLAY_COLUMNS 6             // Columnas visibles en pantalla
+#define RAM_DISPLAY_ROWS 16               // Filas por columna (una por instrucción por
+
+
 // PCB Structure Modification
 typedef struct PCB
 {
@@ -83,9 +92,12 @@ typedef struct PCB
     int KCPUxU; // Contador de uso de CPU por usuario
 
     // SWAP related fields
-    int *TMP;                  // Tabla de Mapa de Páginas del Proceso (array of frame numbers in SWAP)
-    int TmpSize;               // Tamaño de la TMP (cantidad de marcos/páginas del proceso)
     char real_address_str[40]; // For displaying "MarcoReal(Hex):Offset(Hex) | DRS(Hex)"
+
+
+TMPEntry *TMP;    // Tabla de Mapa de Páginas actualizada
+    int TmpSize;      // Número de entradas en TMP
+
 
 } PCB;
 
@@ -129,6 +141,28 @@ void display_swap_info_minimal(int start_frame_tms, int num_frames_tms, int star
 
 #endif
 
+#include <unistd.h>
+#include <sys/select.h>
+#include <time.h>
+
+int kbhit(void)
+{
+    struct timeval tv;
+    fd_set read_fd;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    FD_ZERO(&read_fd);
+    FD_SET(0, &read_fd);
+    if (select(1, &read_fd, NULL, NULL, &tv) == -1)
+        return 0;
+
+    if (FD_ISSET(0, &read_fd))
+        return 1;
+
+    return 0;
+}
+
+
 #include "nc_kbh.h"
 #include "lista.h"
 #include <errno.h>
@@ -164,6 +198,13 @@ void initialize_swap_system()
     {
         tms[i] = TMS_FREE_FRAME;
     }
+    for (int i = 0; i < RAM_FRAMES; i++) {
+    TMM[i].pid = 0;
+    TMM[i].referenced = 0;
+}
+for (int i = 0; i < SWAP_SIZE_FRAMES; i++) {
+    tms[i] = TMS_FREE_FRAME;
+}
 
     // Create or open SWAP file
     swap_file_ptr = fopen(SWAP_FILE_NAME, "wb+"); // Try opening existing
@@ -244,20 +285,20 @@ void handle_process_termination(PCB *pcb)
         }
         // Could also check Nuevos if they can somehow share TMP before loading, though current logic assigns TMP on load.
 
-        if (!is_shared_and_others_exist)
-        { // This is the last process using this TMP
-            for (int i = 0; i < pcb->TmpSize; i++)
-            {
-                int frame_in_swap = pcb->TMP[i];
-                if (frame_in_swap >= 0 && frame_in_swap < SWAP_SIZE_FRAMES)
-                {
-                    tms[frame_in_swap] = TMS_FREE_FRAME; // Mark frame as free
-                }
+        if (!is_shared_and_others_exist) {
+    for (int i = 0; i < pcb->TmpSize; i++) {
+        if (pcb->TMP[i].presence == 1) {
+            int ram_frame = pcb->TMP[i].ram_frame;
+            if (ram_frame >= 0 && ram_frame < RAM_FRAMES) {
+                TMM[ram_frame].pid = 0;
+                TMM[ram_frame].referenced = 0;
             }
-            free(pcb->TMP);
-            pcb->TMP = NULL;
-            pcb->TmpSize = 0;
         }
+    }
+    free(pcb->TMP);
+    pcb->TMP = NULL;
+    pcb->TmpSize = 0;
+}
     }
     // Note: Actual PCB memory (pcb itself) is freed when Terminados list is cleared or managed,
     // this function just handles SWAP resources associated with it.
@@ -302,7 +343,7 @@ void check_nuevos_list_and_load_if_space()
         {
             mvprintw(15, 1, "Space found for PID %d from Nuevos. Loading...", current_nuevo->PID);
             // Allocate TMP
-            current_nuevo->TMP = (int *)malloc(frames_needed * sizeof(int));
+            current_nuevo->TMP = (TMPEntry *)malloc(frames_needed * sizeof(TMPEntry));
             if (!current_nuevo->TMP)
             {
                 mvprintw(16, 1, "Error: No se pudo reservar memoria para TMP de PID %d.", current_nuevo->PID);
@@ -345,7 +386,7 @@ void check_nuevos_list_and_load_if_space()
                     if (tms[j] == TMS_FREE_FRAME)
                     {
                         tms[j] = current_nuevo->PID; // Allocate frame in TMS
-                        current_nuevo->TMP[i] = j;   // Store SWAP frame number in process's TMP
+                        current_nuevo->TMP[i].swap_frame = j;  // Store SWAP frame number in process's TMP
                         found_frame_for_page = j;
                         break;
                     }
@@ -355,7 +396,7 @@ void check_nuevos_list_and_load_if_space()
                     mvprintw(16, 1, "Critical Error: No free frame found during loading PID %d despite check!", current_nuevo->PID);
                     // Rollback allocated frames for this process
                     for (int k = 0; k < i; k++)
-                        tms[current_nuevo->TMP[k]] = TMS_FREE_FRAME;
+                        tms[current_nuevo->TMP[k].swap_frame] = TMS_FREE_FRAME;
                     free(current_nuevo->TMP);
                     current_nuevo->TMP = NULL;
                     fclose(prog_file);
@@ -422,7 +463,72 @@ void check_nuevos_list_and_load_if_space()
         current_nuevo = current_nuevo->sig;
     }
 }
+void handle_page_fault(PCB *pcb, int page_num) {
+    int swap_frame = pcb->TMP[page_num].swap_frame;
+    
+    // Buscar marco libre en RAM
+    int ram_frame = -1;
+    for (int i = 0; i < RAM_FRAMES; i++) {
+        if (TMM[i].pid == 0) {
+            ram_frame = i;
+            break;
+        }
+    }
 
+    // Si no hay marco libre, aplicar algoritmo de reloj
+    if (ram_frame == -1) {
+        // Implementación del algoritmo de reloj
+        while (1) {
+            if (TMM[tmm_clock].referenced == 0) {
+                ram_frame = tmm_clock;
+                // Encontrar proceso propietario
+                PCB *owner = NULL;
+                if (Ejecucion && Ejecucion->PID == TMM[ram_frame].pid) {
+                    owner = Ejecucion;
+                } else {
+                    owner = Listos;
+                    while (owner && owner->PID != TMM[ram_frame].pid) {
+                        owner = owner->sig;
+                    }
+                }
+                
+                // Actualizar TMP del propietario
+                if (owner) {
+                    for (int i = 0; i < owner->TmpSize; i++) {
+                        if (owner->TMP[i].ram_frame == ram_frame && 
+                            owner->TMP[i].presence == 1) {
+                            owner->TMP[i].presence = 0;
+                            owner->TMP[i].ram_frame = -1;
+                            break;
+                        }
+                    }
+                }
+                
+                // Limpiar TMM
+                TMM[ram_frame].pid = 0;
+                TMM[ram_frame].referenced = 0;
+                tmm_clock = (tmm_clock + 1) % RAM_FRAMES;
+                break;
+            } else {
+                TMM[tmm_clock].referenced = 0;
+                tmm_clock = (tmm_clock + 1) % RAM_FRAMES;
+            }
+        }
+    }
+
+    // Cargar marco desde SWAP a RAM
+    long swap_pos = (long)swap_frame * RAM_FRAME_SIZE_INSTRUCTIONS * INSTRUCTION_SIZE_BYTES;
+    fseek(swap_file_ptr, swap_pos, SEEK_SET);
+    fread(RAM + ram_frame * RAM_FRAME_SIZE_INSTRUCTIONS * INSTRUCTION_SIZE_BYTES, 
+          INSTRUCTION_SIZE_BYTES, RAM_FRAME_SIZE_INSTRUCTIONS, swap_file_ptr);
+
+    // Actualizar TMM y TMP
+    TMM[ram_frame].pid = pcb->PID;
+    TMM[ram_frame].referenced = 1;
+    
+    pcb->TMP[page_num].ram_frame = ram_frame;
+    pcb->TMP[page_num].presence = 1;
+}
 // Función principal
 int main()
 {
@@ -433,6 +539,9 @@ int main()
     timeout(0);            // Non-blocking getch
 
     initialize_swap_system(); // Initialize SWAP file and TMS
+// Inicializa RAM con valores predeterminados
+memset(RAM, 0, sizeof(RAM));
+
 
     char comando[200] = ""; // Buffer para el comando
     int comandoIndex = 0;
@@ -511,8 +620,36 @@ int main()
                     continue;
                 }
 
+
+
+                
+
                 int virtual_page = Ejecucion->PC / PAGE_SIZE_INSTRUCTIONS;
                 int offset_in_page = Ejecucion->PC % PAGE_SIZE_INSTRUCTIONS;
+
+// Verificar presencia en RAM
+if (Ejecucion->TMP[virtual_page].presence == 0) {
+    handle_page_fault(Ejecucion, virtual_page);
+    // Después de manejar el fallo, verificar si se cargó correctamente
+    if (Ejecucion->TMP[virtual_page].presence == 0) {
+        // Manejar error
+    }
+}
+
+// Obtener dirección real en RAM
+int ram_frame = Ejecucion->TMP[virtual_page].ram_frame;
+long ram_byte_offset = (long)ram_frame * RAM_FRAME_SIZE_INSTRUCTIONS * INSTRUCTION_SIZE_BYTES + 
+                       (long)offset_in_page * INSTRUCTION_SIZE_BYTES;
+memcpy(Ejecucion->IR, RAM + ram_byte_offset, INSTRUCTION_SIZE_BYTES);
+Ejecucion->IR[INSTRUCTION_SIZE_BYTES] = '\0';
+
+// Marcar como referenciado
+TMM[ram_frame].referenced = 1;
+
+
+
+
+
 
                 if (virtual_page >= Ejecucion->TmpSize)
                 {
@@ -527,7 +664,7 @@ int main()
                     continue;
                 }
 
-                int frame_in_swap = Ejecucion->TMP[virtual_page];
+                int frame_in_swap = Ejecucion->TMP[virtual_page].swap_frame;
                 long drs_instruction_index = (long)frame_in_swap * PAGE_SIZE_INSTRUCTIONS + offset_in_page;
                 long drs_byte_offset = drs_instruction_index * INSTRUCTION_SIZE_CHARS;
 
@@ -876,8 +1013,30 @@ void cargarProceso(char *fileName, int uid)
         free(nuevo);
         return;
     }
+
+    // Verificar espacio en SWAP
+    int free_frames_count = 0;
+    for (int i = 0; i < SWAP_SIZE_FRAMES; i++) {
+        if (tms[i] == TMS_FREE_FRAME) free_frames_count++;
+    }
     int frames_needed = (int)ceil((double)lines / PAGE_SIZE_INSTRUCTIONS);
     nuevo->TmpSize = frames_needed; // Store temporarily, might be updated by sibling logic
+
+
+    // Asigna memoria para TMP como estructura
+    nuevo->TMP = (TMPEntry *)malloc(frames_needed * sizeof(TMPEntry));
+    if (!nuevo->TMP) {
+        mvprintw(16, 1, "Error: No se pudo asignar memoria para TMP.");
+        free(nuevo);
+        return;
+    }
+    
+    // Inicializa TMP
+    for (int i = 0; i < frames_needed; i++) {
+        nuevo->TMP[i].swap_frame = -1;
+        nuevo->TMP[i].ram_frame = -1;
+        nuevo->TMP[i].presence = 0;
+    }
 
     if ((long)frames_needed * PAGE_SIZE_INSTRUCTIONS > SWAP_SIZE_INSTRUCTIONS)
     {
@@ -920,11 +1079,20 @@ void cargarProceso(char *fileName, int uid)
             if (tms[i] == TMS_FREE_FRAME)
                 free_frames_count++;
         }
+        // Asigna nueva memoria para TMP
+    nuevo->TMP = (TMPEntry *)malloc(frames_needed * sizeof(TMPEntry));
+    if (!nuevo->TMP) { /* Manejo de error */ }
+    // Inicializa cada entrada de TMP
+    for (int i = 0; i < frames_needed; i++) {
+        nuevo->TMP[i].swap_frame = -1; // Inicializa como no asignado
+        nuevo->TMP[i].ram_frame = -1;
+        nuevo->TMP[i].presence = 0;
+    }
 
         if (free_frames_count >= frames_needed)
         {
             mvprintw(15, 1, "Cargando %s (PID %d, %d marcos) a SWAP...", fileName, nuevo->PID, frames_needed);
-            nuevo->TMP = (int *)malloc(frames_needed * sizeof(int));
+            nuevo->TMP = (TMPEntry *)malloc(frames_needed * sizeof(TMPEntry));
             if (!nuevo->TMP)
             {
                 mvprintw(16, 1, "Error: No se pudo memoria para TMP de PID %d.", nuevo->PID);
@@ -952,7 +1120,7 @@ void cargarProceso(char *fileName, int uid)
                     if (tms[j] == TMS_FREE_FRAME)
                     {
                         tms[j] = nuevo->PID;
-                        nuevo->TMP[i] = j;
+                        nuevo->TMP[i].swap_frame = j;
                         allocated_swf = j;
                         break;
                     }
@@ -961,7 +1129,7 @@ void cargarProceso(char *fileName, int uid)
                 { /* Should not happen due to prior check */
                     mvprintw(16, 1, "CRITICAL: No SWAP frame for PID %d page %d.", nuevo->PID, i);
                     for (int k = 0; k < i; k++)
-                        tms[nuevo->TMP[k]] = TMS_FREE_FRAME; // Rollback
+                        tms[nuevo->TMP[k].swap_frame] = TMS_FREE_FRAME; // Rollback
                     free(nuevo->TMP);
                     fclose(prog_file_to_load);
                     free(nuevo);
@@ -1288,7 +1456,18 @@ void ejecutarInstruccion(PCB *pcb)
         listaInsertarFinal(&Terminados, to_terminate); // Add to terminated list
         // actualizaPesoUsuarios and check_nuevos will be called in main loop
         return; // Return to main loop, Ejecucion is now NULL
+    }else if (strcmp(instruccion, "JNZ") == 0) {
+    if (isNumeric(p2)) {
+        int target = atoi(p2);
+        if (pcb->CX != 0) {
+            pcb->PC = target;
+            // Reiniciar ejecución para nueva dirección
+            return;
+        }
+    } else {
+        // Manejar error
     }
+}
     else
     {
         // Truncate IR for display if it's too long or contains non-printable chars
@@ -1489,6 +1668,7 @@ void imprimirListas()
         tms_display_start = 0;
     }
 
+
     mvprintw(current_y++, 1, "---TMS---");
     mvprintw(current_y++, 1, "Marco-PID");
 
@@ -1502,6 +1682,76 @@ void imprimirListas()
              "TMS F9: Siguiente | F10: Anterior");
 
     current_y++; // Add a blank line after TMP
+
+if (tmm_display_start >= RAM_FRAMES) {
+    tmm_display_start = RAM_FRAMES - TMS_DISPLAY_ENTRIES;
+}
+if (tmm_display_start < 0) {
+    tmm_display_start = 0;
+}
+
+// En la sección de visualización de TMM
+mvprintw(current_y++, 1, "---TMM---");
+mvprintw(current_y++, 1, "Marco-PID");
+// Mostrar solo las entradas visibles en la página actual
+for (int i = tmm_display_start; i < tmm_display_start + TMS_DISPLAY_ENTRIES && i < RAM_FRAMES; ++i) {
+    mvprintw(current_y++, 1, "%03X - %-3X", i, TMM[i].pid);
+}
+// Mostrar indicadores de navegación
+mvprintw(current_y++, 1, "TMM F5: Siguiente | F6: Anterior");
+current_y++; 
+current_y++; 
+    // --- Visualización del contenido de RAM ---
+// Mostrar RAM (al lado de TMM)
+int ram_x_pos = 100; // Posición X para RAM
+current_y = bottom_left_start_line; // Reiniciar Y para RAM
+mvprintw(current_y++, ram_x_pos, "--RAM--[%d] Marcos de [%d] Inst de [%d]Bytes c/u = [%ld] Bytes",
+         RAM_FRAMES, RAM_FRAME_SIZE_INSTRUCTIONS, INSTRUCTION_SIZE_BYTES, 
+         (long)RAM_SIZE_INSTRUCTIONS * INSTRUCTION_SIZE_BYTES);
+current_y++;
+
+
+// Línea de separación
+for (int k = 0; k < 78; k++) {
+    mvaddch(current_y - 1, k + ram_x_pos, '-');
+}
+current_y++; // Nueva línea para contenido de RAM
+
+// Mostrar contenido de RAM en formato por columnas
+for (int col = 0; col < RAM_DISPLAY_COLUMNS; col++) {
+    int frame_idx = ram_display_start_frame + col;
+    if (frame_idx >= RAM_FRAMES) continue;
+    
+    int x_pos = ram_x_pos + col * (7 + SWAP_CONTENT_INSTR_TRUNCATE_LEN);
+    mvprintw(current_y, x_pos, "[%04X]", frame_idx); // Índice del marco
+    
+    for (int row = 0; row < RAM_FRAME_SIZE_INSTRUCTIONS; row++) {
+        long instr_idx = (long)frame_idx * RAM_FRAME_SIZE_INSTRUCTIONS + row;
+        if (instr_idx >= RAM_SIZE_INSTRUCTIONS) break;
+        
+        // Calcular offset en RAM
+        long ram_byte_offset = instr_idx * INSTRUCTION_SIZE_BYTES;
+        char *instr_ptr = RAM + ram_byte_offset;
+        
+        // Truncar instrucción para mostrar
+        char display_instr[SWAP_CONTENT_INSTR_TRUNCATE_LEN + 1];
+        strncpy(display_instr, instr_ptr, SWAP_CONTENT_INSTR_TRUNCATE_LEN);
+        display_instr[SWAP_CONTENT_INSTR_TRUNCATE_LEN] = '\0';
+        
+        // Mostrar instrucción
+        mvprintw(current_y + row + 1, x_pos, "[%04lX]%*s%-*s", 
+                 instr_idx, 2, "", SWAP_CONTENT_INSTR_TRUNCATE_LEN, display_instr);
+    }
+}
+
+// Mostrar indicadores de navegación de RAM
+current_y += RAM_FRAME_SIZE_INSTRUCTIONS + 2;
+mvprintw(current_y, ram_x_pos, "RAM F1: Siguiente | F2: Anterior | Frame Inicial: %04X", ram_display_start_frame);
+
+
+current_y++; 
+
+
 
     // --- New SWAP Content Display ---
     if (swap_file_ptr)
@@ -1772,7 +2022,34 @@ void manejarLineaComandos(char *comando, int *comandoIndex, char historial[HISTO
             if (tms_display_start < 0)
                 tms_display_start = 0;
         }
+    }else if (tecla == KEY_F(5)) { // F5 para navegar hacia adelante en TMM
+    if (tmm_display_start < RAM_FRAMES - TMS_DISPLAY_ENTRIES) {
+        tmm_display_start += TMS_DISPLAY_ENTRIES;
+    } else {
+        tmm_display_start = 0; // Volver al inicio si llegamos al final
     }
+}
+else if (tecla == KEY_F(6)) { // F6 para navegar hacia atrás en TMM
+    if (tmm_display_start >= TMS_DISPLAY_ENTRIES) {
+        tmm_display_start -= TMS_DISPLAY_ENTRIES;
+    } else {
+        tmm_display_start = RAM_FRAMES - TMS_DISPLAY_ENTRIES;
+        if (tmm_display_start < 0) tmm_display_start = 0;
+    }
+}else if (tecla == KEY_F(1)) { // F1 para navegar hacia adelante en RAM
+    if (ram_display_start_frame < RAM_FRAMES - RAM_DISPLAY_COLUMNS) {
+        ram_display_start_frame++;
+    } else {
+        ram_display_start_frame = 0;
+    }
+}
+else if (tecla == KEY_F(2)) { // F2 para navegar hacia atrás en RAM
+    if (ram_display_start_frame > 0) {
+        ram_display_start_frame--;
+    } else {
+        ram_display_start_frame = RAM_FRAMES - RAM_DISPLAY_COLUMNS;
+    }
+}
 
     move(1, 1);
     clrtoeol();
@@ -1807,4 +2084,3 @@ void strUpper(char *str)
     for (int i = 0; str[i]; i++)
         str[i] = toupper(str[i]);
 }
-
